@@ -14,6 +14,9 @@ class LpProblem:
     def __str__(self):
         return str(self.model)
 
+    def solve(self):
+        return self.model.solve()
+
 
 class DecisionSeries:
     """
@@ -45,7 +48,9 @@ class DecisionSeries:
             self.index = np.array(index)
 
         if model is not None:
-            self.model = model.model
+            self.model = model
+        else:
+            self.model = None
 
         if len(self.index) != len(self.values):
             raise Exception(f'DecisionArray index (len={len(self.index)}) and values'
@@ -82,9 +87,9 @@ class DecisionSeries:
                     idx + max(self.index) - len(self) + 1: op(0, other[idx]) for idx in range(len(self), len(other))}
             else:
                 raise TypeError(f"unsupported operand type(s) for +: 'DecisionSeries' and '{type(other)}'")
-            return DecisionSeries(data=dict(sorted(data.items())))
+            return DecisionSeries(data=dict(sorted(data.items())), model=self.model)
         else:
-            return DecisionSeries(data={idx: op(self[idx], other) for idx in self.index})
+            return DecisionSeries(data={idx: op(self[idx], other) for idx in self.index}, model=self.model)
 
     def __add__(self, other):
         return self.operation(other, operator.add)
@@ -100,7 +105,7 @@ class DecisionSeries:
     __rmul__ = __mul__
 
     def __neg__(self):
-        return DecisionSeries(data=-self.values, index=self.index)
+        return DecisionSeries(data=-self.values, index=self.index, model=self.model)
 
     def __len__(self):
         return len(self.index)
@@ -130,6 +135,7 @@ class DecisionSeries:
         :param relation: in (operator.eq, operator.ge, operator.le, '==', '>=', '<=')
         :param other: DecisionSeries, pd.Series or dict
         """
+        model = model.model
         if relation in ('==', '>=', '<='):
             relation = (operator.eq, operator.ge, operator.le)[('==', '>=', '<=').index(relation)]
         elif relation not in (operator.eq, operator.ge, operator.le):
@@ -185,8 +191,8 @@ class DecisionMatrix:
             elif type(data) in (DecisionMatrix, pd.DataFrame):
                 self.index, self.columns, self.values = data.index, data.columns, data.values
             elif type(data) in (list, np.ndarray):
-                self.index = len(data)
-
+                self.index, self.columns = [np.array(range(dim)) for dim in data.shape]
+                self.values = np.array(data)
             else:
                 raise Exception(f"Data type '{type(data)}' is not valid")
         else:
@@ -202,8 +208,8 @@ class DecisionMatrix:
 
     @classmethod
     def lp_variable(cls, name, index, columns, column_type='', cat='Binary', low_bound=None, up_bound=None, model=None):
-        return DecisionMatrix({column: pulp.LpVariable.dict(
-            f'{name}_{column_type}{column}', index, low_bound, up_bound, cat) for column in columns}, index, columns)
+        return DecisionMatrix({column: pulp.LpVariable.dict(f'{name}_{column_type}{column}', index, low_bound, up_bound,
+                                                            cat) for column in columns}, index, columns, model)
 
     def operation(self, other, op):
         pass
@@ -248,18 +254,41 @@ class DecisionMatrix:
     def __str__(self):
         return str(pd.DataFrame(data=self.values, index=self.index, columns=self.columns))
 
+    def sum(self):
+        return DecisionSeries(data={column: self[column].sum() for column in self.columns})
+
     def add_constraint(self, model, relation, other):
-        pass
+        if type(other) in (DecisionMatrix, pd.DataFrame):
+            for column in set(self.columns).intersection(set(other.columns)):
+                self[column].add_constraint(model, relation, other[column])
+        else:
+            for column in self.columns:
+                self[column].add_constraint(model, relation, other)
+
+    def add_constraint_simple(self, relation, other):
+        if self.model is None:
+            raise Exception('model is not defined')
+        return self.add_constraint(self.model, relation, other)
+
+    def __ge__(self, other):
+        return self.add_constraint_simple(operator.ge, other)
+
+    def __le__(self, other):
+        return self.add_constraint_simple(operator.le, other)
+
+    def __eq__(self, other):
+        return self.add_constraint_simple(operator.eq, other)
+
+    def value(self):
+        return DecisionMatrix(np.vectorize(pulp.value)(self.values), self.index, self.columns, self.model)
 
 
 if __name__ == '__main__':
     prob = LpProblem()
-    a = DecisionSeries.lp_variable('bench', np.array(range(10)), model=prob)
-    b = DecisionSeries.lp_variable('lineup', np.array(range(10)), model=prob)
-    c = a + b
-    prob += a >= b
-    lineup = DecisionMatrix.lp_variable('lineup', range(4, 20), range(1, 9), column_type='gw')
+    lineup = DecisionMatrix.lp_variable('lineup', range(20), range(1, 9), column_type='gw', model=prob)
+    bench = DecisionMatrix.lp_variable('bench', range(20), range(1, 9), column_type='gw', model=prob)
+    prob += bench <= lineup
+    prob += 1
 
-    print(lineup)
-    lineup[9] = 10
-    print(lineup)
+    prob.solve()
+    print(lineup.value())
