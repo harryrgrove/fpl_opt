@@ -212,7 +212,15 @@ class DecisionMatrix:
                                                             cat) for column in columns}, index, columns, model)
 
     def operation(self, other, op):
-        pass
+        new = DecisionMatrix(self)
+        if type(other) in (DecisionMatrix, pd.DataFrame):
+            for column in set(new.columns).intersection(other.columns):
+                new[column] = op(DecisionSeries(new[column]), DecisionSeries(other[column]))
+                print(new[column])
+        else:
+            for column in new.columns:
+                new[column] = op(DecisionSeries(new[column]), other)
+        return new
 
     def __add__(self, other):
         return self.operation(other, operator.add)
@@ -252,7 +260,7 @@ class DecisionMatrix:
             self.values = np.append(self.values, np.array(value)[:, None], axis=1)
 
     def __str__(self):
-        return str(pd.DataFrame(data=self.values, index=self.index, columns=self.columns))
+        return str(pd.DataFrame(data=self.values.astype(str), index=self.index, columns=self.columns))
 
     def sum(self):
         return DecisionSeries(data={column: self[column].sum() for column in self.columns})
@@ -289,6 +297,5 @@ if __name__ == '__main__':
     bench = DecisionMatrix.lp_variable('bench', range(20), range(1, 9), column_type='gw', model=prob)
     prob += bench <= lineup
     prob += 1
-
-    prob.solve()
-    print(lineup.value())
+    print(bench + lineup)
+    #prob.solve()
