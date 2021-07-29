@@ -216,7 +216,6 @@ class DecisionMatrix:
         if type(other) in (DecisionMatrix, pd.DataFrame):
             for column in set(new.columns).intersection(other.columns):
                 new[column] = op(DecisionSeries(new[column]), DecisionSeries(other[column]))
-                print(new[column])
         else:
             for column in new.columns:
                 new[column] = op(DecisionSeries(new[column]), other)
