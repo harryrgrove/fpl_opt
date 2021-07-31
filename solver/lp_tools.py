@@ -5,7 +5,14 @@ import pandas as pd
 
 
 class LpProblem:
+    """
+    Outer class for pulp.LpVariable, same functionality for adding constraints and solving
+    """
     def __init__(self, name='NoName', sense=pulp.LpMaximize):
+        """
+        :param name: Reference name of model
+        :param sense: pulp.LpMaximize, pulp.LpMinimize
+        """
         self.model = pulp.LpProblem(name, sense)
 
     def __iadd__(self, other):
@@ -47,10 +54,7 @@ class DecisionSeries:
         if index is not None:
             self.index = np.array(index)
 
-        if model is not None:
-            self.model = model
-        else:
-            self.model = None
+        self.model = model
 
         if len(self.index) != len(self.values):
             raise Exception(f'DecisionArray index (len={len(self.index)}) and values'
@@ -59,6 +63,18 @@ class DecisionSeries:
     @classmethod
     def lp_variable(cls, name, index, column_type=None, column_instance='', low_bound=None, up_bound=None, cat='Binary',
                     model=None):
+        """
+        Method for generating instance of DecisionSeries from pulp.LpVariable.dict object
+        :param name: Name of decision variable
+        :param index: Index of DecisionSeries
+        :param column_type: Type of column, e.g. GW in FPL. None if column type is not relevant.
+        :param column_instance: Nth instance of column, usually placement in DecisionMatrix
+        :param low_bound: Lower bound of decision variable contained in self.values
+        :param up_bound: Upper bound of decision variable contained in self.values
+        :param cat: Category of decision variable contained in self.values
+        :param model: LpProblem object of which variable is a part
+        :return: DecisionSeries containing pulp.LpVariable objects
+        """
         if column_type is not None:
             return DecisionSeries(
                 pulp.LpVariable.dict(f'{name}_{column_type}{column_instance}', index, low_bound, up_bound, cat),
@@ -66,44 +82,57 @@ class DecisionSeries:
         else:
             return DecisionSeries(pulp.LpVariable.dict(f'{name}', index, low_bound, up_bound, cat), model=model)
 
-    def operation(self, other, op):
+    def operation(self, other, op, drop=False):
         """
-        Operands of different sizes/indexes are supported, unmatched values are 0
-        Operand with type list and np.array are unstable and not not recommended
+        :param other: array-like or float-like
+        :param op: operator from operator library
+        :param drop: If True, only columns common to self and other are kept
+        :return: operation(self, other) through index where non-common indices are treated as 0
+        Operands of different indexes are supported, unmatched values are 0
+        If other has no index, must be the same length as self
         """
+        # Filter between scalar and element-wise operations
         if hasattr(other, '__getitem__'):
-            if type(other) in (DecisionSeries, pd.Series):
-                data = {idx: op(self[idx], other[idx]) for idx in set(self.index).intersection(set(other.index))} | {
-                    idx: op(self[idx], 0) for idx in set(self.index) - set(other.index)} | {
-                    idx: op(0, other[idx]) for idx in set(other.index) - set(self.index)}
-            elif type(other) == dict:
-                data = {idx: op(self[idx], other[idx]) for idx in set(self.index).intersection(set(other.keys()))} | {
-                    idx: op(self[idx], 0) for idx in set(self.index) - set(other.keys())} | {
-                    idx: op(0, other[idx]) for idx in set(other.keys()) - set(self.index)}
-            elif type(other) in (list, np.array):
-                data = {self.index[idx]: op(self.values[idx], other[idx]) for idx in range(min(len(self), len(other)))}\
-                       | {self.index[idx]: op(self.values[idx], 0) for idx in range(len(other), len(self))} | {
-                    idx + max(self.index) - len(self) + 1: op(0, other[idx]) for idx in range(len(self), len(other))}
+            # Operation is element-wise
+            if type(other) in (list, range, np.ndarray):
+                if len(self) != len(other):
+                    raise Exception('Operands have different lengths')
+                data = {self.index[idx]: op(self.values[idx], other[idx]) for idx in range(len(self))}
             else:
-                raise TypeError(f"unsupported operand type(s) for +: 'DecisionSeries' and '{type(other)}'")
+                if type(other) in (DecisionSeries, pd.Series):
+                    self_index, other_index = self.index, other.index
+                elif type(other) == dict:
+                    self_index, other_index = self.index, other.keys()
+                else:
+                    raise TypeError(f"unsupported operand type(s) for {str(op).split(' ')[-1][:-1]}: "
+                                    f"'DecisionSeries' and '{type(other)}'")
+
+                data = {idx: op(self[idx], other[idx]) for idx in set(self_index).intersection(set(other_index))}
+                if not drop:
+                    data |= {idx: op(self[idx], 0) for idx in set(self_index) - set(other_index)} | {
+                           idx: op(0, other[idx]) for idx in set(other_index) - set(self_index)}
             return DecisionSeries(dict(sorted(data.items())), model=self.model)
         else:
             return DecisionSeries({idx: op(self[idx], other) for idx in self.index}, model=self.model)
 
-    def __add__(self, other):
-        return self.operation(other, operator.add)
+    def __add__(self, other, drop=False):
+        return self.operation(other, operator.add, drop)
 
     __radd__ = __add__
 
-    def __sub__(self, other):
-        return self.operation(other, operator.sub)
+    def __sub__(self, other, drop=False):
+        return self.operation(other, operator.sub, drop)
 
-    def __mul__(self, other):
-        return self.operation(other, operator.mul)
+    def __mul__(self, other, drop=False):
+        # Element-wise, not matrix multiplication
+        return self.operation(other, operator.mul, drop)
 
     __rmul__ = __mul__
 
     def __neg__(self):
+        """
+        :return: Additive inverse of DecisionSeries Vales
+        """
         return DecisionSeries(-self.values, self.index, self.model)
 
     def __len__(self):
@@ -118,14 +147,39 @@ class DecisionSeries:
     def __setitem__(self, key, value):
         self.values[(list(self.index).index(key))] = value
 
+    def drop(self, labels, inplace=True):
+        if not hasattr(labels, '__iter__'):
+            # make all labels iterable
+            label_iter = [labels]
+        else:
+            label_iter = labels
+
+        values = self.values
+        index = self.index
+        for label in label_iter:
+            loc = list(index).index(label)
+            index = np.delete(index, loc)
+            values = np.delete(values, loc)
+        if not inplace:
+            return DecisionSeries(values, index, self.model)
+        else:
+            self.index = index
+            self.values = values
+
     def __iter__(self):
-        for value in list(self.values):
+        for value in self.values:
             yield value
 
     def __str__(self):
+        """
+        :return: string representation of self, same style as pd.Series
+        """
         return str(pd.Series(data=[str(value) for value in self.values], index=self.index, dtype='object'))
 
     def sum(self):
+        """
+        :return: sum of all elements in self.values
+        """
         return pulp.lpSum(self.values)
 
     def add_constraint(self, model, relation, other):
@@ -151,6 +205,9 @@ class DecisionSeries:
                 model += relation(self[i], other)
 
     def add_constraint_simple(self, relation, other):
+        """
+        Same functionality as self.add_constraint, assuming self.model is not NoneType
+        """
         if not self.model:
             raise Exception('Model is not defined')
         return self.add_constraint(self.model, relation, other)
@@ -165,11 +222,10 @@ class DecisionSeries:
         return self.add_constraint_simple(operator.eq, other)
 
     def get_value(self):
+        """
+        :return: DecisionSeries containing pulp.value(element) for each element in self.values
+        """
         return DecisionSeries([pulp.value(item) for item in self.values], self.index, self.model)
-
-
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
 
 class DecisionMatrix:
@@ -206,32 +262,58 @@ class DecisionMatrix:
         self.model = model
 
     @classmethod
-    def lp_variable(cls, name, index, columns, column_type='', cat='Binary', low_bound=None, up_bound=None, model=None):
+    def lp_variable(cls, name, index, columns, column_type='', low_bound=None, up_bound=None, cat='Binary', model=None):
+        """
+        Method for generating instance of DecisionMatrix from pulp.LpVariable.dicts object
+        :param name: Name of decision variable
+        :param index: Index of DecisionMatrix
+        :param columns: Ordered column names of DecisionMatrix
+        :param column_type: Type of column, e.g. GW in FPL. None if column type is not relevant.
+        :param low_bound: Lower bound of decision variable contained in self.values
+        :param up_bound: Upper bound of decision variable contained in self.values
+        :param cat: Category of decision variable contained in self.values
+        :param model: LpProblem object of which variable is a part
+        :return: DecisionMatrix containing pulp.LpVariable objects
+        """
         return DecisionMatrix({column: pulp.LpVariable.dict(f'{name}_{column_type}{column}', index, low_bound, up_bound,
                                                             cat) for column in columns}, index, columns, model)
 
-    def operation(self, other, op):
-        new = DecisionMatrix(self, model=self.model)
+    def operation(self, other, op, drop=False):
+        """
+        :param other: matrix-like, array-like or float-like
+        :param op: operator from operator library
+        :param drop: If true, keep non-common columns in output (operation with zero)
+        :return: operation(self, other)
+        """
         if type(other) in (DecisionMatrix, pd.DataFrame):
-            for column in set(new.columns).intersection(other.columns):
-                new[column] = op(DecisionSeries(new[column]), DecisionSeries(other[column]))
+            data = {column: op(DecisionSeries(self[column]), DecisionSeries(other[column]))
+                    for column in set(self.columns).intersection(other.columns)}
+            if not drop:
+                data |= {column: op(DecisionSeries(self[column]), 0) for column in set(
+                    self.columns) - set(other.columns)} | {column: op(0, DecisionSeries(other[column]))
+                                                           for column in set(other.columns) - set(self.columns)}
         else:
-            for column in new.columns:
-                new[column] = op(DecisionSeries(new[column]), other)
-        return new
+            data = {column: op(DecisionSeries(self[column]), other) for column in self.columns}
+        return DecisionMatrix(dict(sorted(data.items())), model=self.model)
 
-    def __add__(self, other):
-        return self.operation(other, operator.add)
+    def __add__(self, other, drop=False):
+        return self.operation(other, operator.add, drop)
 
     __radd__ = __add__
 
-    def __sub__(self, other):
-        return self.operation(other, operator.sub)
+    def __sub__(self, other, drop=False):
+        return self.operation(other, operator.sub, drop)
 
-    def __mul__(self, other):
-        return self.operation(other, operator.mul)
+    def __mul__(self, other, drop=False):
+        return self.operation(other, operator.mul, drop)
 
     __rmul__ = __mul__
+
+    def __neg__(self):
+        return DecisionMatrix(-self.values, self.index, self.columns, self.model)
+
+    def __len__(self):
+        return len(self.index)
 
     def __getitem__(self, item):
         if type(item) == tuple:
@@ -257,11 +339,60 @@ class DecisionMatrix:
                 value = np.repeat(value, len(self.index))
             self.values = np.append(self.values, np.array(value)[:, None], axis=1)
 
+    def drop(self, labels=None, axis=0, inplace=False):
+        """
+        :param labels: single label or list-like (labels to be removed)
+        :param axis: Whether to drop labels from the index (0 or ‘index’) or columns (1 or ‘columns’).
+        :param inplace: If False, return a copy. Otherwise, do operation
+        :return: DecisionMatrix with columns in labels parameter removed
+        """
+        if not hasattr(labels, '__iter__'):
+            # make all labels iterable
+            label_iter = [labels]
+        else:
+            label_iter = labels
+
+        if axis in (0, 'index'):
+            axis_labels = self.index
+        elif axis in (1, 'columns'):
+            axis_labels = self.columns
+        else:
+            raise Exception('Invalid axis name')
+
+        values = self.values
+        for label in label_iter:
+            loc = list(axis_labels).index(label)
+            axis_labels = np.delete(axis_labels, loc)
+            values = np.delete(values, loc, axis)
+        if axis in (0, 'index'):
+            if not inplace:
+                return DecisionMatrix(values, axis_labels, self.columns, self.model)
+            else:
+                self.index = axis_labels
+                self.values = values
+        elif axis in (1, 'columns'):
+            if not inplace:
+                return DecisionMatrix(values, self.index, axis_labels, self.model)
+            else:
+                self.columns = axis_labels
+                self.values = values
+
+    def __iter__(self):
+        for value in self.columns:
+            yield value
+
     def __str__(self):
         return str(pd.DataFrame(data=self.values.astype(str), index=self.index, columns=self.columns))
 
     def sum(self):
         return DecisionSeries({column: self[column].sum() for column in self.columns}, model=self.model)
+
+    def transpose(self):
+        return DecisionMatrix(self.values.T, self.columns, self.index, self.model)
+
+    @property
+    def T(self):
+        return self.transpose()
 
     def lag(self, value):
         return DecisionMatrix(self.values, self.index, self.columns + value, self.model)
@@ -293,11 +424,11 @@ class DecisionMatrix:
 
 
 if __name__ == '__main__':
+    df = pd.DataFrame(data={1: [1,2,3,4,5], 2: [4,6,2,4,6]})
     prob = LpProblem()
     lineup = DecisionMatrix.lp_variable('lineup', range(20), range(1, 9), column_type='gw', model=prob)
     bench = DecisionMatrix.lp_variable('bench', range(20), range(9), column_type='gw', model=prob)
     prob += 1
-    squad = bench.lag(1) + lineup
-    prob += squad <= 1
+    squad = bench + lineup
     print(squad)
-    prob.solve()
+    prob += squad <= 1
