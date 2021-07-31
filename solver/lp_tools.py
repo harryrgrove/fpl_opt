@@ -57,15 +57,14 @@ class DecisionSeries:
                             f' (len={len(self.values)}) are not the same length')
 
     @classmethod
-    def lp_variable(cls, name, index, column_type=None, column_instance='', cat='Binary', low_bound=None,
-                    up_bound=None, model=None):
+    def lp_variable(cls, name, index, column_type=None, column_instance='', low_bound=None, up_bound=None, cat='Binary',
+                    model=None):
         if column_type is not None:
             return DecisionSeries(
-                data=pulp.LpVariable.dict(f'{name}_{column_type}{column_instance}', index, cat=cat, lowBound=low_bound,
-                                          upBound=up_bound), model=model)
+                pulp.LpVariable.dict(f'{name}_{column_type}{column_instance}', index, low_bound, up_bound, cat),
+                model=model)
         else:
-            return DecisionSeries(data=pulp.LpVariable.dict(
-                f'{name}', index, cat=cat, lowBound=low_bound, upBound=up_bound), model=model)
+            return DecisionSeries(pulp.LpVariable.dict(f'{name}', index, low_bound, up_bound, cat), model=model)
 
     def operation(self, other, op):
         """
@@ -87,9 +86,9 @@ class DecisionSeries:
                     idx + max(self.index) - len(self) + 1: op(0, other[idx]) for idx in range(len(self), len(other))}
             else:
                 raise TypeError(f"unsupported operand type(s) for +: 'DecisionSeries' and '{type(other)}'")
-            return DecisionSeries(data=dict(sorted(data.items())), model=self.model)
+            return DecisionSeries(dict(sorted(data.items())), model=self.model)
         else:
-            return DecisionSeries(data={idx: op(self[idx], other) for idx in self.index}, model=self.model)
+            return DecisionSeries({idx: op(self[idx], other) for idx in self.index}, model=self.model)
 
     def __add__(self, other):
         return self.operation(other, operator.add)
@@ -105,7 +104,7 @@ class DecisionSeries:
     __rmul__ = __mul__
 
     def __neg__(self):
-        return DecisionSeries(data=-self.values, index=self.index, model=self.model)
+        return DecisionSeries(-self.values, self.index, self.model)
 
     def __len__(self):
         return len(self.index)
@@ -165,8 +164,8 @@ class DecisionSeries:
     def __eq__(self, other):
         return self.add_constraint_simple(operator.eq, other)
 
-    def value(self):
-        return DecisionSeries(data=[pulp.value(item) for item in self.values], index=self.index)
+    def get_value(self):
+        return DecisionSeries([pulp.value(item) for item in self.values], self.index, self.model)
 
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -187,7 +186,7 @@ class DecisionMatrix:
             if type(data) == dict:
                 self.columns = np.array(list(data.keys()))
                 self.index = np.array(range(len(data[self.columns[0]])))
-                self.values = np.array([DecisionSeries(data=data[column]).values for column in data]).T
+                self.values = np.array([DecisionSeries(data[column]).values for column in data]).T
             elif type(data) in (DecisionMatrix, pd.DataFrame):
                 self.index, self.columns, self.values = data.index, data.columns, data.values
             elif type(data) in (list, np.ndarray):
@@ -199,10 +198,10 @@ class DecisionMatrix:
             self.values, self.index, self.columns = [np.array([])] * 3
 
         if index is not None:
-            self.index = index
+            self.index = np.array(index)
 
         if columns is not None:
-            self.columns = columns
+            self.columns = np.array(columns)
 
         self.model = model
 
@@ -212,7 +211,7 @@ class DecisionMatrix:
                                                             cat) for column in columns}, index, columns, model)
 
     def operation(self, other, op):
-        new = DecisionMatrix(self)
+        new = DecisionMatrix(self, model=self.model)
         if type(other) in (DecisionMatrix, pd.DataFrame):
             for column in set(new.columns).intersection(other.columns):
                 new[column] = op(DecisionSeries(new[column]), DecisionSeries(other[column]))
@@ -241,7 +240,7 @@ class DecisionMatrix:
         else:
             try:
                 column_loc = list(self.columns).index(item)
-                return DecisionSeries([row[column_loc] for row in self.values], index=self.index, model=self.model)
+                return DecisionSeries([row[column_loc] for row in self.values], self.index, self.model)
             except ValueError:
                 raise ValueError(f'{item} not in columns')
 
@@ -262,7 +261,10 @@ class DecisionMatrix:
         return str(pd.DataFrame(data=self.values.astype(str), index=self.index, columns=self.columns))
 
     def sum(self):
-        return DecisionSeries(data={column: self[column].sum() for column in self.columns})
+        return DecisionSeries({column: self[column].sum() for column in self.columns}, model=self.model)
+
+    def lag(self, value):
+        return DecisionMatrix(self.values, self.index, self.columns + value, self.model)
 
     def add_constraint(self, model, relation, other):
         if type(other) in (DecisionMatrix, pd.DataFrame):
@@ -286,15 +288,16 @@ class DecisionMatrix:
     def __eq__(self, other):
         return self.add_constraint_simple(operator.eq, other)
 
-    def value(self):
+    def get_value(self):
         return DecisionMatrix(np.vectorize(pulp.value)(self.values), self.index, self.columns, self.model)
 
 
 if __name__ == '__main__':
     prob = LpProblem()
     lineup = DecisionMatrix.lp_variable('lineup', range(20), range(1, 9), column_type='gw', model=prob)
-    bench = DecisionMatrix.lp_variable('bench', range(20), range(1, 9), column_type='gw', model=prob)
-    prob += bench <= lineup
+    bench = DecisionMatrix.lp_variable('bench', range(20), range(9), column_type='gw', model=prob)
     prob += 1
-    print(bench + lineup)
-    #prob.solve()
+    squad = bench.lag(1) + lineup
+    prob += squad <= 1
+    print(squad)
+    prob.solve()
