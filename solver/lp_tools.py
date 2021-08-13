@@ -46,6 +46,11 @@ class DecisionSeries:
                 self.index, self.values = data.index, data.values
             elif type(data) in (list, np.ndarray):
                 self.index, self.values = range(len(data)), np.array(data)
+            elif type(data) in (int, float):
+                if index is not None:
+                    self.values = np.repeat(data, len(index))
+                else:
+                    raise Exception(f'If data type is {type(data)} then index must be specified')
             else:
                 raise Exception(f"Data type '{type(data)}' is not valid")
         else:
@@ -56,8 +61,8 @@ class DecisionSeries:
 
         self.model = model
 
-        if len(self.index) != len(self.values):
-            raise Exception(f'DecisionArray index (len={len(self.index)}) and values'
+        if len(self) != len(self.values):
+            raise Exception(f'DecisionSeries index (len={len(self)}) and values'
                             f' (len={len(self.values)}) are not the same length')
 
     @classmethod
@@ -120,7 +125,7 @@ class DecisionSeries:
 
     __radd__ = __add__
 
-    def __sub__(self, other, drop=False):
+    def __sub__(self, other, drop=True):
         return self.operation(other, operator.sub, drop)
 
     def __mul__(self, other, drop=False):
@@ -139,32 +144,41 @@ class DecisionSeries:
         return len(self.index)
 
     def __getitem__(self, item):
-        try:
-            return self.values[(list(self.index).index(item))]
-        except ValueError:
-            raise ValueError(f'{item} not in index')
+        if hasattr(item, '__len__'):
+            if len(item) == len(self):
+                return DecisionSeries(data=self.values[[index for index, i in enumerate(item) if i == 1]],
+                                      index=self.index[[index for index, i in enumerate(item) if i == 1]],
+                                      model=self.model)
+            else:
+                raise ValueError('Invalid index filter')
+        else:
+            try:
+                return self.values[(list(self.index).index(item))]
+            except ValueError:
+                raise ValueError(f'{item} not in index')
 
     def __setitem__(self, key, value):
-        self.values[(list(self.index).index(key))] = value
+        if key in self.index:
+            self.values[(list(self.index).index(key))] = value
+        else:
+            self.index = np.append(self.index, key)
+            self.values = np.append(self.values, value)
 
     def drop(self, labels, inplace=True):
         if not hasattr(labels, '__iter__'):
             # make all labels iterable
-            label_iter = [labels]
+            iter_labels = [labels]
         else:
-            label_iter = labels
+            iter_labels = labels
 
-        values = self.values
-        index = self.index
-        for label in label_iter:
+        values, index = self.values, self.index
+        for label in iter_labels:
             loc = list(index).index(label)
-            index = np.delete(index, loc)
-            values = np.delete(values, loc)
+            index, values = np.delete(index, loc), np.delete(values, loc)
         if not inplace:
             return DecisionSeries(values, index, self.model)
         else:
-            self.index = index
-            self.values = values
+            self.index, self.values = index, values
 
     def __iter__(self):
         for value in self.values:
@@ -181,6 +195,9 @@ class DecisionSeries:
         :return: sum of all elements in self.values
         """
         return pulp.lpSum(self.values)
+
+    def lag(self, value):
+        return DecisionSeries(self.values, self.index + value, self.model)
 
     def add_constraint(self, model, relation, other):
         """
@@ -206,7 +223,7 @@ class DecisionSeries:
 
     def add_constraint_simple(self, relation, other):
         """
-        Same functionality as self.add_constraint, assuming self.model is not NoneType
+        Same functionality as self.add_constraint, with model=self.model is not NoneType
         """
         if not self.model:
             raise Exception('Model is not defined')
@@ -296,7 +313,7 @@ class DecisionMatrix:
             data = {column: op(DecisionSeries(self[column]), other) for column in self.columns}
         return DecisionMatrix(dict(sorted(data.items())), model=self.model)
 
-    def __add__(self, other, drop=False):
+    def __add__(self, other, drop=True):
         return self.operation(other, operator.add, drop)
 
     __radd__ = __add__
@@ -319,6 +336,12 @@ class DecisionMatrix:
         if type(item) == tuple:
             index, col = item
             return self[col][index]
+        elif hasattr(item, '__len__'):
+            if len(item) == len(self):
+                return DecisionMatrix({col_name: DecisionSeries(col, self.index, self.model)[item] for col, col_name in
+                                       zip(self.values.T, self.columns)},
+                                      index=self.index[[index for index, i in enumerate(item) if i == 1]],
+                                      model=self.model)
         else:
             try:
                 column_loc = list(self.columns).index(item)
@@ -333,10 +356,13 @@ class DecisionMatrix:
         elif key in self.columns:
             column_loc = list(self.columns).index(key)
             self.values[:, column_loc] = value
+        elif not hasattr(value, '__getitem__'):
+            value = np.repeat(value, len(self))
+        elif all(column > key for column in self.columns):
+            self.columns = np.insert(self.columns, 0, key, axis=0)
+            self.values = np.concatenate([np.array(value)[:, None], self.values], axis=1)
         else:
             self.columns = np.append(self.columns, key)
-            if not hasattr(value, '__getitem__'):
-                value = np.repeat(value, len(self.index))
             self.values = np.append(self.values, np.array(value)[:, None], axis=1)
 
     def drop(self, labels=None, axis=0, inplace=False):
@@ -348,9 +374,9 @@ class DecisionMatrix:
         """
         if not hasattr(labels, '__iter__'):
             # make all labels iterable
-            label_iter = [labels]
+            iter_labels = [labels]
         else:
-            label_iter = labels
+            iter_labels = labels
 
         if axis in (0, 'index'):
             axis_labels = self.index
@@ -360,22 +386,19 @@ class DecisionMatrix:
             raise Exception('Invalid axis name')
 
         values = self.values
-        for label in label_iter:
+        for label in iter_labels:
             loc = list(axis_labels).index(label)
-            axis_labels = np.delete(axis_labels, loc)
-            values = np.delete(values, loc, axis)
+            axis_labels, values = np.delete(axis_labels, loc), np.delete(values, loc, axis)
         if axis in (0, 'index'):
             if not inplace:
                 return DecisionMatrix(values, axis_labels, self.columns, self.model)
             else:
-                self.index = axis_labels
-                self.values = values
+                self.index, self.values = axis_labels, values
         elif axis in (1, 'columns'):
             if not inplace:
                 return DecisionMatrix(values, self.index, axis_labels, self.model)
             else:
-                self.columns = axis_labels
-                self.values = values
+                self.columns, self.values = axis_labels, values
 
     def __iter__(self):
         for value in self.columns:
@@ -394,8 +417,13 @@ class DecisionMatrix:
     def T(self):
         return self.transpose()
 
-    def lag(self, value):
-        return DecisionMatrix(self.values, self.index, self.columns + value, self.model)
+    def lag(self, value, axis=1):
+        if axis in (1, 'columns'):
+            return DecisionMatrix(self.values, self.index, self.columns + value, self.model)
+        elif axis in (0, 'index'):
+            return DecisionMatrix(self.values, self.index, self.columns + value, self.model)
+        else:
+            raise Exception('Invalid axis name')
 
     def add_constraint(self, model, relation, other):
         if type(other) in (DecisionMatrix, pd.DataFrame):
@@ -424,11 +452,11 @@ class DecisionMatrix:
 
 
 if __name__ == '__main__':
-    df = pd.DataFrame(data={1: [1,2,3,4,5], 2: [4,6,2,4,6]})
     prob = LpProblem()
-    lineup = DecisionMatrix.lp_variable('lineup', range(20), range(1, 9), column_type='gw', model=prob)
+    args = {'index': range(20), 'columns': range(1, 9), 'column_type': 'gw', 'model': 'prob'}
+    lineup = DecisionMatrix.lp_variable('lineup', **args)
+    print(lineup[[False, True] * 10])
     bench = DecisionMatrix.lp_variable('bench', range(20), range(9), column_type='gw', model=prob)
     prob += 1
-    squad = bench + lineup
-    print(squad)
+    squad = bench.lag(1) + lineup
     prob += squad <= 1

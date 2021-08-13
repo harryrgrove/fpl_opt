@@ -373,6 +373,7 @@ class Solver:
             (aux + 1).add_constraint(prob, '==', free_transfers)
             penalised_transfers.add_constraint(prob, '>=', transfer_diffs)
             penalised_transfers.add_constraint(prob, '>=', 0)
+            print(frees_minus_transfers)
 
         projections = pd.DataFrame(data[[f'{gw}_Pts' for gw in gw_interval]])
         projections.columns = gw_interval
