@@ -37,7 +37,6 @@ class Solver:
             horizon: int = 8,
             bench_weights: List[List[float]] = None,
             vc_weight: float = 0,
-            decay_rate: float = 0.84,
             penalties: Dict[Callable, float] = None,
             budget_decay_rate: int = 0,
             transfer_pattern: List[int] = None,
@@ -47,7 +46,6 @@ class Solver:
         :param horizon: Number of future GWs included in optimisation, max=8
         :param bench_weights: [bench_gk_weight, 1st_bench_weight, 2nd_bench_weight, 3rd_bench_weight]
         :param vc_weight: Extra weight of vice captain in objective function
-        :param decay_rate: Exponential decay parameter; gw N has relative weight decay_rate^(N-1) in objective function
         :param penalties: Dict of penalty functions taking self, current objective and parameter
         :param budget_decay_rate: Linear decay parameter; budget reduces by budget_decay_rate each future GW
         :param transfer_pattern: Manual override for transfer logic, nth element is transfers in n GWs from now
@@ -68,7 +66,6 @@ class Solver:
         else:
             self.bench_weights = bench_weights
         self.vc_weight = vc_weight
-        self.decay_rate = decay_rate
         if penalties is None:
             self.penalties = []
         else:
@@ -251,5 +248,5 @@ class Solution:
 if __name__ == '__main__':
     ev = (get_fplreview(2021, 1))
     my_squad = Squad(players=[68, 375, 141, 70, 219, 274, 236, 232, 250, 140, 195, 114, 39, 77, 314])
-    my_solver = Solver(horizon=8, penalties={ft_penalty: 0.5, time_decay: 0.84})
+    my_solver = Solver(horizon=8, penalties={ft_penalty: 0.75, time_decay: 0.84})
     print(my_solver.solve(ev, my_squad, force_chips={1: 'wildcard'}))
