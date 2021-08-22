@@ -4,6 +4,8 @@ from typing import List, Callable, Dict
 import pandas as pd
 import numpy as np
 import pulp
+import requests
+import json
 
 
 def get_fplreview(season, next_gw):
@@ -23,7 +25,17 @@ class Squad:
 
     @classmethod
     def from_id(cls, fpl_id, gw):
-        pass
+        # Get picks info by FPL ID
+        session = requests.Session()
+        api_path = 'https://fantasy.premierleague.com/api'
+        response = session.get(f'{api_path}/entry/{fpl_id}/event/{gw}/picks/#/')
+        data = json.loads(response.text)
+        return Squad(
+            players=[d['element'] - 1 for d in data['picks']],
+            itb=data['entry_history']['bank'] / 10,
+            active_chip=data['active_chip'],
+            fts=1   # Needs update after GW1
+        )
 
 
 class Solver:
@@ -36,9 +48,9 @@ class Solver:
             self,
             horizon: int = 8,
             bench_weights: List[List[float]] = None,
-            vc_weight: float = 0,
+            vc_weight: float = 0.05,
             penalties: Dict[Callable, float] = None,
-            budget_decay_rate: int = 0,
+            budget_decay_rate: float = 0,
             transfer_pattern: List[int] = None,
             exclude_everton: bool = False
     ):
@@ -81,7 +93,7 @@ class Solver:
             self,
             projections: pd.DataFrame,
             initial_squad: Squad,
-            next_gw: int = 1,
+            next_gw: int = None,
             force_chips: Dict[int, str] = None,
             force_players: Dict[str, list] = None,
             force_transfers: Dict[int, dict] = None
@@ -98,6 +110,8 @@ class Solver:
             player list 1 to be transferred in for players in player list 2 in gw_a
         :return: class Solution containing transfer and team selection data for optimal solution
         """
+        if next_gw is None:
+            next_gw = sorted([int(column.split('_')[0]) for column in projections.columns if column.endswith('Pts')])[0]
         # Set up useful references
         initial_players = initial_squad.players
         initial_itb = initial_squad.itb
@@ -119,7 +133,7 @@ class Solver:
         bench_2 = DecisionMatrix.lp_variable('bench_2', **default_args)
         bench_3 = DecisionMatrix.lp_variable('bench_3', **default_args)
         squad = lineup + bench_gk + bench_1 + bench_2 + bench_3
-        squad[0] = players.isin(initial_players).astype(int)
+        squad[next_gw - 1] = players.isin(initial_players).astype(int)
         captain = DecisionMatrix.lp_variable('captain', **default_args)
         vice_captain = DecisionMatrix.lp_variable('vice_captain', **default_args)
         transfer_in = DecisionMatrix.lp_variable('transfer_in', **default_args)
@@ -132,6 +146,7 @@ class Solver:
 
         # Add problem constraints to optimisation model
         prob += squad == squad.lag(1) + transfer_in - transfer_out  # New squad is previous squad plus transfers
+        prob += squad.drop(next_gw - 1, axis=1) <= 1  # Each player can only appear in the squad once
         prob += lineup.sum() == 11  # Lineup contains 11 players
         prob += bench_gk.sum() == 1     # There is 1 bench GK;
         prob += bench_1.sum() == 1  # 1 1st bench slot;
@@ -146,6 +161,8 @@ class Solver:
             prob += squad[projections['Pos'] == position].sum() == limit    # Set squad position structure
         for team in teams:
             prob += squad[projections['Team'] == team].sum() <= 3   # No more than 3 players from each team
+        if self.exclude_everton:
+            prob += squad[projections['Team'] == 'Everton'].sum() == 0  # Option to exclude Everton players
         prob += bench_gk <= (projections['Pos'] == 'G')     # Bench GK must be a goalkeeper
         prob += (lineup * (projections['Pos'] == 'G')).sum() == 1   # There must be 1 goalkeeper in lineup
         prob += (lineup * (projections['Pos'] == 'D')).sum() >= 3   # There must be at least 3 defenders in lineup
@@ -154,22 +171,26 @@ class Solver:
         # Set up transfer logic
         transfer_args = {'index': gw_interval, 'column_type': 'gw', 'model': prob, 'cat': 'Integer'}
         aux = DecisionSeries.lp_variable('aux', **transfer_args)
-        free_transfers = DecisionSeries(data=[initial_fts], index=[0], model=prob) + DecisionSeries.lp_variable(
-            'free_transfers', **transfer_args)
+        free_transfers = DecisionSeries(data=[initial_fts], index=[next_gw - 1], model=prob) + DecisionSeries.\
+            lp_variable('free_transfers', **transfer_args)
         penalised_transfers = DecisionSeries.lp_variable('penalised_transfers', **transfer_args)
         transfer_counts = transfer_in.sum()
         frees_minus_transfers = free_transfers.lag(1) - transfer_counts
         lower_bound = aux * 15 - 14
         upper_bound = aux * 2
+        if initial_fts > 1:
+            prob += transfer_counts[next_gw] >= 1
         prob += frees_minus_transfers >= lower_bound
         prob += frees_minus_transfers <= upper_bound
         prob += free_transfers == aux + 1
+        # penalised_transfers is max(transfers - frees, 0)
         prob += penalised_transfers >= -frees_minus_transfers
         prob += penalised_transfers >= 0
 
         ev_values = projections[[f'{gw}_Pts' for gw in gw_interval]]    # Restructure projections data for easier
         ev_values.columns = gw_interval                                 # manipulation
         objective = ((lineup + captain) * ev_values).sum()  # Objective function is sum of lineup and captain pts
+        objective += (vice_captain * self.vc_weight * ev_values).sum()  # Add vice-captain weight
         for loc, bench_slot in enumerate((bench_gk, bench_1, bench_2, bench_3)):
             objective += (bench_slot * ev_values).sum() * self.bench_weights[:, loc]    # Add bench weights to objective
         if force_transfers is None:
@@ -179,15 +200,29 @@ class Solver:
                 for gw in force_chips:
                     if force_chips[gw] == 'wildcard':
                         objective[gw] += penalised_transfers[gw] * 4    # Remove penalised points in wildcard week
+
+        if force_players is not None:
+            for player in force_players['include']:
+                prob += squad.T[player].drop(0) == 1
+            for player in force_players['exclude']:
+                prob += squad.T[player].drop(0) == 0
         self.rolls = frees_minus_transfers + penalised_transfers
 
         if self.penalties is not None:
+            if time_decay in self.penalties:
+                self.penalties[time_decay] = self.penalties.pop(time_decay)     # Apply time decay after other penalties
             for penalty, parameter in self.penalties.items():
-                objective = penalty(objective, self, parameter)  # Take away external solver penalty functions
+                objective = penalty(objective, self, parameter)  # Apply external penalty functions
 
         prob.model += objective.sum()
         prob.solve()
-        return Solution(lineup, bench_gk, bench_1, bench_2, bench_3, objective, transfer_in, transfer_out)
+        return Solution(lineup, bench_gk, bench_1, bench_2, bench_3, captain, vice_captain, objective, transfer_in,
+                        transfer_out, itb, projections)
+
+
+class ObjectivePenalty:
+    def __init__(self):
+        pass
 
 
 def ft_penalty(objective, solver, parameter):
@@ -203,16 +238,19 @@ def time_decay(objective, solver, parameter):
 
 
 class Solution:
-    def __init__(self, lineup, bench_gk, bench_1, bench_2, bench_3, objective,
-                 transfer_in, transfer_out, next_gw=1, season=2021):
-        self.data = pd.read_csv(root_dir + f'/data/fplreview/{season}/GW{next_gw}.csv')    # Get current EV projections
+    def __init__(self, lineup, bench_gk, bench_1, bench_2, bench_3, captain, vice_captain, objective,
+                 transfer_in, transfer_out, itb, projections):
+        self.data = projections    # Get current EV projections
         self.lineup = lineup
         self.bench_gk = bench_gk
         self.bench_1 = bench_1
         self.bench_2 = bench_2
         self.bench_3 = bench_3
+        self.captain = captain
+        self.vice_captain = vice_captain
         self.transfer_in = transfer_in
         self.transfer_out = transfer_out
+        self.itb = itb
         self.objective = objective
 
     def __str__(self):
@@ -231,7 +269,10 @@ class Solution:
             for position in ['G', 'D', 'M', 'F']:
                 players = self.data[self.data['Pos'] == position]
                 gw_lineup = sorted(
-                    players['Name'][[player for player in players.index if self.lineup[player, gw].varValue]].tolist())
+                    [players['Name'][player] +
+                     ' (C)' * int(self.captain[player, gw].varValue) +
+                     ' (VC)' * int(self.vice_captain[player, gw].varValue)
+                     for player in players.index if self.lineup[player, gw].varValue])
                 output += '  '.join(gw_lineup).center(40, ' ') + '\n'
             bench = []
             for bench_slot in [self.bench_gk, self.bench_1, self.bench_2, self.bench_3]:
@@ -241,12 +282,13 @@ class Solution:
             output += f'GW{gw} Objective: {pulp.value(self.objective[gw])}' + '\n' * 3
         return output[:-3]
 
-    def eval(self):
+    def eval(self, bench_weights, vc_weight):
         pass
 
 
 if __name__ == '__main__':
-    ev = (get_fplreview(2021, 1))
-    my_squad = Squad(players=[68, 375, 141, 70, 219, 274, 236, 232, 250, 140, 195, 114, 39, 77, 314])
-    my_solver = Solver(horizon=8, penalties={ft_penalty: 0.75, time_decay: 0.84})
-    print(my_solver.solve(ev, my_squad, force_chips={1: 'wildcard'}))
+    ev = get_fplreview(2021, 2)
+    my_squad = Squad.from_id(1433, 1)
+    my_solver = Solver(horizon=8, penalties={ft_penalty: 0.9, time_decay: 0.84})
+    solution = my_solver.solve(ev, my_squad, force_players={'include': [], 'exclude': []})
+    print(solution)
