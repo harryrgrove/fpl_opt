@@ -16,13 +16,15 @@ class LpProblem:
         self.model = pulp.LpProblem(name, sense)
 
     def __iadd__(self, other):
+        if type(other) == pulp.pulp.LpConstraint:
+            self.model += other
         return self
 
     def __str__(self):
         return str(self.model)
 
-    def solve(self):
-        return self.model.solve()
+    def solve(self, time_limit=10000, optimizer=pulp.GUROBI, message=True):
+        return self.model.solve(optimizer(timeLimit=time_limit, msg=message))
 
 
 class DecisionSeries:
@@ -164,7 +166,7 @@ class DecisionSeries:
             self.index = np.append(self.index, key)
             self.values = np.append(self.values, value)
 
-    def drop(self, labels, inplace=True):
+    def drop(self, labels, inplace=False):
         if not hasattr(labels, '__iter__'):
             # make all labels iterable
             iter_labels = [labels]

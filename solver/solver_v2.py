@@ -1,41 +1,10 @@
-from lp_tools import LpProblem, DecisionSeries, DecisionMatrix
+from solver.lp_tools import LpProblem, DecisionSeries, DecisionMatrix
+from solver.fpl_tools import Projections, Squad
 from definitions import root_dir
-from typing import List, Callable, Dict
-import pandas as pd
 import numpy as np
+from typing import List, Callable, Dict, Iterable
+import pandas as pd
 import pulp
-import requests
-import json
-
-
-def get_fplreview(season, next_gw):
-    """
-    :param season: Starting year of relevant season
-    :param next_gw: Earliest gameweek contained in projections
-    :return: pd.Dataframe object with columns '{gw}_pts' for each gw in projections
-    """
-    df = pd.read_csv(root_dir + f'/data/fplreview/{season}/GW{next_gw}.csv')
-    df.index = df.index.rename('ID')
-    return df
-
-
-class Squad:
-    def __init__(self, players: List[int], itb: float = 0, fts: int = 1, active_chip: str = None):
-        self.players, self.itb, self.fts, self.active_chip = players, itb, fts, active_chip
-
-    @classmethod
-    def from_id(cls, fpl_id, gw):
-        # Get picks info by FPL ID
-        session = requests.Session()
-        api_path = 'https://fantasy.premierleague.com/api'
-        response = session.get(f'{api_path}/entry/{fpl_id}/event/{gw}/picks/#/')
-        data = json.loads(response.text)
-        return Squad(
-            players=[d['element'] - 1 for d in data['picks']],
-            itb=data['entry_history']['bank'] / 10,
-            active_chip=data['active_chip'],
-            fts=1   # Needs update after GW1
-        )
 
 
 class Solver:
@@ -52,7 +21,8 @@ class Solver:
             penalties: Dict[Callable, float] = None,
             budget_decay_rate: float = 0,
             transfer_pattern: List[int] = None,
-            exclude_everton: bool = False
+            million_value=0.45,
+            exclude_everton: bool = False,
     ):
         """
         :param horizon: Number of future GWs included in optimisation, max=8
@@ -61,6 +31,7 @@ class Solver:
         :param penalties: Dict of penalty functions taking self, current objective and parameter
         :param budget_decay_rate: Linear decay parameter; budget reduces by budget_decay_rate each future GW
         :param transfer_pattern: Manual override for transfer logic, nth element is transfers in n GWs from now
+        :param million_value: User-defined value of £1 million in FPL, used to factor in price changes. "solve" solves.
         :param exclude_everton: If True, no Everton players are included in solutions
         """
         self.horizon = horizon
@@ -78,12 +49,15 @@ class Solver:
         else:
             self.bench_weights = bench_weights
         self.vc_weight = vc_weight
-        if penalties is None:
-            self.penalties = []
-        else:
-            self.penalties = penalties
+        self.penalties = penalties
         self.budget_decay_rate = budget_decay_rate
         self.transfer_pattern = transfer_pattern
+        if million_value == 'solve':
+            # Investigate value of 1 million in current FPL game state
+            pass
+        else:
+            pass
+        self.million_value = million_value
         self.exclude_everton = exclude_everton
 
         self.rolls = None
@@ -91,12 +65,16 @@ class Solver:
 
     def solve(
             self,
-            projections: pd.DataFrame,
+            projections: Projections,
             initial_squad: Squad,
             next_gw: int = None,
             force_chips: Dict[int, str] = None,
             force_players: Dict[str, list] = None,
-            force_transfers: Dict[int, dict] = None
+            force_transfers: Dict[int, dict] = None,
+            price_changes: Dict[str, Iterable] = None,
+            time_limit: float = None,
+            optimizer: type = pulp.GUROBI,
+            message: bool = True
     ):
         """
         Method for solving specific instance of FPL problem
@@ -108,6 +86,10 @@ class Solver:
         :param force_players: {'include': [{players to include}], 'exclude': [{players to exclude}]}
         :param force_transfers: {gw_a: {'in': [{player list 1}], 'out': [{player list 2}]}, gw_b: ...} forces players in
             player list 1 to be transferred in for players in player list 2 in gw_a
+        :param price_changes:
+        :param time_limit: Set time limit for optimisation (in seconds)
+        :param optimizer: Which optimiser to use
+        :param message: if False, suppress optimisation output:
         :return: class Solution containing transfer and team selection data for optimal solution
         """
         if next_gw is None:
@@ -132,8 +114,9 @@ class Solver:
         bench_1 = DecisionMatrix.lp_variable('bench_1', **default_args)
         bench_2 = DecisionMatrix.lp_variable('bench_2', **default_args)
         bench_3 = DecisionMatrix.lp_variable('bench_3', **default_args)
-        squad = lineup + bench_gk + bench_1 + bench_2 + bench_3
-        squad[next_gw - 1] = players.isin(initial_players).astype(int)
+        squad = DecisionMatrix.lp_variable('squad', **default_args)
+        prob += squad == lineup + bench_gk + bench_1 + bench_2 + bench_3
+        squad[next_gw - 1] = pd.Series(squad.index).isin(initial_players).astype(int)
         captain = DecisionMatrix.lp_variable('captain', **default_args)
         vice_captain = DecisionMatrix.lp_variable('vice_captain', **default_args)
         transfer_in = DecisionMatrix.lp_variable('transfer_in', **default_args)
@@ -153,6 +136,8 @@ class Solver:
         prob += bench_2.sum() == 1  # 1 2nd bench slot;
         prob += bench_3.sum() == 1  # 1 3rd bench slot;
         prob += captain.sum() == 1  # 1 Captain;
+        prob += transfer_out.sum() == transfer_in.sum()     # Transfers in must be same as transfers out
+
         prob += vice_captain.sum() == 1     # 1 vice-captain
         prob += captain <= lineup   # Captain must be in lineup
         prob += vice_captain <= lineup  # Vice-captain must be in lineup
@@ -166,7 +151,7 @@ class Solver:
         prob += bench_gk <= (projections['Pos'] == 'G')     # Bench GK must be a goalkeeper
         prob += (lineup * (projections['Pos'] == 'G')).sum() == 1   # There must be 1 goalkeeper in lineup
         prob += (lineup * (projections['Pos'] == 'D')).sum() >= 3   # There must be at least 3 defenders in lineup
-        prob += itb >= 0    # The amount of money in the bank must be non-negative
+        prob += itb[[False] + [True] * self.horizon] >= 0   # The itb amount must be non-negative for future GWs
 
         # Set up transfer logic
         transfer_args = {'index': gw_interval, 'column_type': 'gw', 'model': prob, 'cat': 'Integer'}
@@ -203,10 +188,23 @@ class Solver:
 
         if force_players is not None:
             for player in force_players['include']:
-                prob += squad.T[player].drop(0) == 1
+                prob += squad.T[player].drop(next_gw - 1) == 1
             for player in force_players['exclude']:
-                prob += squad.T[player].drop(0) == 0
+                prob += squad.T[player].drop(next_gw - 1) == 0
+            if 'include_for_gw' in force_players:
+                for gw in force_players['include_for_gw']:
+                    try:
+                        prob += squad[force_players['include_for_gw'][gw], gw] == 1
+                    except ValueError:
+                        pass
+            if 'exclude_for_gw' in force_players:
+                for gw in force_players['exclude_for_gw']:
+                    try:
+                        prob += squad[force_players['exclude_for_gw'][gw], gw] == 0
+                    except ValueError:
+                        pass
         self.rolls = frees_minus_transfers + penalised_transfers
+        prob += self.rolls <= 2
 
         if self.penalties is not None:
             if time_decay in self.penalties:
@@ -214,18 +212,32 @@ class Solver:
             for penalty, parameter in self.penalties.items():
                 objective = penalty(objective, self, parameter)  # Apply external penalty functions
 
+        # Apply price change EV
+        if price_changes is not None:
+            gws_remaining = 38 - next_gw + 1
+            for player in price_changes['rise']:
+                objective[next_gw] += self.million_value / 30 * squad[player, next_gw] * gws_remaining
+            for player in price_changes['drop']:
+                objective[next_gw] -= self.million_value / 10 * squad[player, next_gw] * gws_remaining
+
         prob.model += objective.sum()
-        prob.solve()
+        prob.solve(time_limit=time_limit, optimizer=optimizer, message=message)
+
         return Solution(lineup, bench_gk, bench_1, bench_2, bench_3, captain, vice_captain, objective, transfer_in,
-                        transfer_out, itb, projections)
+                        transfer_out, itb, projections, free_transfers, penalised_transfers, force_chips)
 
 
-class ObjectivePenalty:
-    def __init__(self):
+class ObjectivePenalty:     # TODO
+    def __init__(self, penalty_func, parameter):
+        pass
+
+    def apply(self, objective):
         pass
 
 
 def ft_penalty(objective, solver, parameter):
+    if parameter == 0:  # Unsolved glitch occurs when ft_penalty = 0
+        parameter = 0.01
     if solver.force_chips is not None:
         for gw in solver.force_chips:
             if solver.force_chips[gw] == 'wildcard':
@@ -239,7 +251,7 @@ def time_decay(objective, solver, parameter):
 
 class Solution:
     def __init__(self, lineup, bench_gk, bench_1, bench_2, bench_3, captain, vice_captain, objective,
-                 transfer_in, transfer_out, itb, projections):
+                 transfer_in, transfer_out, itb, projections, free_transfers, penalised_transfers, chips):
         self.data = projections    # Get current EV projections
         self.lineup = lineup
         self.bench_gk = bench_gk
@@ -252,43 +264,83 @@ class Solution:
         self.transfer_out = transfer_out
         self.itb = itb
         self.objective = objective
+        self.free_transfers = free_transfers
+        self.penalised_transfers = penalised_transfers
+        self.chips = chips
+        self.bench_weights = None
 
     def __str__(self):
         output = ''
+        lineup, bench_gk, bench_1, bench_2, bench_3, captain, vice_captain, transfer_in, transfer_out = \
+            [variable.get_value() for variable in (
+                self.lineup, self.bench_gk, self.bench_1, self.bench_2, self.bench_3, self.captain, self.vice_captain,
+                self.transfer_in, self.transfer_out)]
         for gw in self.lineup.columns:
-            players_in = self.data['Name'][
-                [player for player in self.data.index if self.transfer_in[player, gw].varValue]].tolist()
-            players_out = self.data['Name'][
-                [player for player in self.data.index if self.transfer_out[player, gw].varValue]].tolist()
+            players_in = [self.data.loc[i, 'Name'] for i in transfer_in[gw][pd.Series(transfer_in[gw]) >= 0.5].index]
+            players_out = [self.data.loc[i, 'Name'] for i in transfer_in[gw][pd.Series(transfer_out[gw]) >= 0.5].index]
             players_in, players_out = [player for player in players_in if player not in players_out], \
                                       [player for player in players_out if player not in players_in]
-
-            output += '-' * 40 + '\n' + 'Transfer out: ' + ', '.join(players_out) + '\n'
-            output += 'Transfer in: ' + ', '.join(players_in) + '\n' + '-' * 40 + '\n'
-
-            for position in ['G', 'D', 'M', 'F']:
-                players = self.data[self.data['Pos'] == position]
-                gw_lineup = sorted(
-                    [players['Name'][player] +
-                     ' (C)' * int(self.captain[player, gw].varValue) +
-                     ' (VC)' * int(self.vice_captain[player, gw].varValue)
-                     for player in players.index if self.lineup[player, gw].varValue])
-                output += '  '.join(gw_lineup).center(40, ' ') + '\n'
-            bench = []
-            for bench_slot in [self.bench_gk, self.bench_1, self.bench_2, self.bench_3]:
-                bench.append(self.data['Name'][[
-                    player for player in self.data.index if bench_slot[player, gw].varValue]].tolist()[0])
-            output += '-' * 40 + '\n' + '  '.join(bench).center(40, ' ') + '\n' + '=' * 40 + '\n'
+            output += '-' * 60 + '\n' + 'Transfer out: ' + ', '.join(players_out) + '\n'
+            output += 'Transfer in: ' + ', '.join(players_in) + '\n' + '-' * 60 + '\n'
+            gw_lineup = lineup[gw][pd.Series(lineup[gw]) >= 0.5].index
+            for position in ('G', 'D', 'M', 'F'):
+                pos_players = [self.data.loc[i, 'Name'] + ' (C)' * int(captain[i, gw]) + ' (VC)' *
+                               int(vice_captain[i, gw]) for i in sorted(gw_lineup, key=lambda i: self.data.loc[
+                                i, f'{gw}_Pts'], reverse=True) if self.data.loc[i, 'Pos'] == position]
+                output += '  '.join(pos_players).center(60, ' ') + '\n'
+            gw_bench_gk = self.data.loc[bench_gk[gw][pd.Series(bench_gk[gw]) >= 0.5].index[0], 'Name']
+            gw_bench_1 = self.data.loc[bench_1[gw][pd.Series(bench_1[gw]) >= 0.5].index[0], 'Name']
+            gw_bench_2 = self.data.loc[bench_2[gw][pd.Series(bench_2[gw]) >= 0.5].index[0], 'Name']
+            gw_bench_3 = self.data.loc[bench_3[gw][pd.Series(bench_3[gw]) >= 0.5].index[0], 'Name']
+            bench = [gw_bench_gk, gw_bench_1, gw_bench_2, gw_bench_3]
+            output += '-' * 60 + '\n' + '  '.join(bench).center(60, ' ') + '\n' + '=' * 60 + '\n'
             output += f'GW{gw} Objective: {pulp.value(self.objective[gw])}' + '\n' * 3
         return output[:-3]
 
-    def eval(self, bench_weights, vc_weight):
-        pass
+    def eval(self, gws_from_now=0, bench_weights=None, vc_weight=0):
+        if bench_weights is None:
+            bench_weights = np.array([0.001, 0.15, 0.01, 0.001])
+        gw = self.lineup.columns[gws_from_now]
+        ev_sum = 0
+        for variable in (self.lineup, self.captain):
+            ev_sum += (variable[gw].get_value() * self.data[f'{gw}_Pts']).sum()
+        for bench_slot, weight in zip([self.bench_gk, self.bench_1, self.bench_2, self.bench_3], bench_weights):
+            ev_sum += (bench_slot[gw].get_value() * self.data[f'{gw}_Pts']).sum() * weight
+        ev_sum += (self.vice_captain[gw].get_value() * self.data[f'{gw}_Pts']).sum() * vc_weight
+
+        penalised_transfers = self.penalised_transfers.get_value()
+        if self.chips is not None:
+            for gw in self.chips:
+                if self.chips[gw] == 'wildcard':
+                    penalised_transfers[gw] = 0
+        ev_sum -= penalised_transfers.sum() * 4
+
+        return ev_sum
+
+
+def main():
+    gw = 7
+    ev = Projections.get_fplreview(2021, gw)
+    my_squad = Squad.from_id(1433, gw - 1)
+    print(my_squad)
+
+    solver = Solver(
+        horizon=6,
+        penalties={
+            ft_penalty: 1.2,
+            time_decay: 0.84
+        },
+        million_value=0.45
+    )
+    solution = solver.solve(
+        projections=ev,
+        initial_squad=my_squad,
+        force_players={'include': [], 'exclude': [ev.get_player('Alonso')], 'include_for_gw': {}, 'exclude_for_gw': {}},
+        force_chips={8: 'wildcard'},
+        price_changes={'rise': [ev.get_player('Rudiger')], 'drop': [ev.get_player('Shaw')]}
+    )
+    print(solution)
 
 
 if __name__ == '__main__':
-    ev = get_fplreview(2021, 2)
-    my_squad = Squad.from_id(1433, 1)
-    my_solver = Solver(horizon=8, penalties={ft_penalty: 0.9, time_decay: 0.84})
-    solution = my_solver.solve(ev, my_squad, force_players={'include': [], 'exclude': []})
-    print(solution)
+    main()
